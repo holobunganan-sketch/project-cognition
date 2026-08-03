@@ -6,7 +6,7 @@ The local database is `.project-cognition/cache/index.sqlite3`.
 
 ### `meta`
 
-Key-value metadata including schema version, snapshot, project root, Git HEAD, branch, and generation timestamps.
+Key-value metadata including schema version, tool version, snapshot, project root, Git HEAD, branch, generation timestamps, last full-hash verification time, and FTS5 availability.
 
 ### `files`
 
@@ -18,8 +18,7 @@ One row per indexed file:
 - category and language
 - line count
 - top-level module
-- text/binary eligibility
-- extracted search terms
+- extracted weighted search terms
 - entrypoint score
 - last indexed snapshot
 
@@ -38,6 +37,14 @@ Language-specific import/include targets and line numbers.
 ### `changes`
 
 Added, modified, deleted, and renamed paths for each snapshot.
+
+### `file_search`
+
+Optional SQLite FTS5 virtual table containing weighted path and file terms. It is created and backfilled automatically when the Python SQLite build supports FTS5. Retrieval uses the existing deterministic path when FTS5 is unavailable.
+
+## Context-pack sidecars
+
+Each cached context pack can have a JSON sidecar containing the selected files and cache-key inputs. Cache identity includes the project snapshot, task, limits, related-file mode, selected paths, and durable-knowledge digest.
 
 ## Generated files
 

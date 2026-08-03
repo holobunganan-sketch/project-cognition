@@ -1,9 +1,9 @@
 interface:
   display_name: "Project Cognition"
-  short_description: "Incremental project indexing and task context"
+  short_description: "Verified incremental project indexing and task context"
   icon_small: "./assets/icon-small.svg"
   icon_large: "./assets/icon-large.svg"
   brand_color: "#2563EB"
-  default_prompt: "Build or refresh project cognition, generate a compact context pack for this task, and verify important conclusions against source files."
+  default_prompt: "Build or refresh verified project cognition, expand the task context with direct dependencies and callers, and confirm important conclusions against source files."
 policy:
   allow_implicit_invocation: true

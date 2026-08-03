@@ -19,6 +19,14 @@ python "<skill-directory>/scripts/project_cognition.py" prepare --project "<proj
 
 Use `python3` when `python` is unavailable. Do not install packages. The script uses only the Python standard library.
 
+For a package inside a monorepo, use `--exact-root` only when the user wants that package indexed independently:
+
+```bash
+python "<skill-directory>/scripts/project_cognition.py" prepare \
+  --project "<package-directory>" \
+  --exact-root
+```
+
 ### 2. Read the prepare result
 
 The command prints JSON. Handle these states:
@@ -28,6 +36,8 @@ The command prints JSON. Handle these states:
 - `updated`: changed files were incrementally re-indexed.
 - `rebuild_required`: run `rebuild` before continuing.
 - `failed`: report the concrete failure and inspect project files directly.
+
+Review the `synchronization` object. Git-reported paths and paths changed between the indexed and current Git HEAD are hashed even when file metadata is unchanged. A full hash verification runs periodically and can be requested explicitly with `--verify-hashes`.
 
 Read `.project-cognition/START_HERE.md` after initialization or when the project overview changed.
 
@@ -41,7 +51,11 @@ python "<skill-directory>/scripts/project_cognition.py" context \
   --task "<the user's current task>"
 ```
 
-Read the returned context-pack path. Use it as navigation, then open the original source files that support important conclusions or edits.
+The command synchronizes first, then combines lexical retrieval, optional SQLite FTS5 filtering, symbols, headings, imports, recent changes, entrypoint scores, and one-hop dependency/importer expansion.
+
+Read the returned context-pack path. A `state` of `cached` means the same task context was safely reused for the current snapshot and durable knowledge. Use the pack as navigation, then open the original source files that support important conclusions or edits.
+
+Use `--no-related` only when the task needs a strictly lexical file set. Use `--verify-hashes` when immediate complete content verification matters.
 
 ### 4. Perform the task
 
@@ -53,6 +67,7 @@ Follow these rules:
 - Do not index ignored files, secrets, credentials, private keys, build output, dependency directories, or binary content.
 - Do not manually rewrite files under `.project-cognition/generated/` or `.project-cognition/cache/`.
 - Human or agent notes belong under `.project-cognition/knowledge/`.
+- Treat imported dependency relationships as navigation hints; confirm them in source files.
 
 ### 5. Refresh after modifications
 
@@ -72,10 +87,36 @@ This provides read-after-write consistency for later project queries. Refresh on
 python "<skill-directory>/scripts/project_cognition.py" status --project "<project-root>"
 ```
 
+`status` checks metadata and Git-reported paths. Run `prepare` for final content-hash confirmation.
+
+### Force complete hash verification
+
+```bash
+python "<skill-directory>/scripts/project_cognition.py" prepare \
+  --project "<project-root>" \
+  --verify-hashes
+```
+
+The default periodic full-hash interval is 24 hours. Change it only when project size and consistency requirements justify a different interval:
+
+```bash
+python "<skill-directory>/scripts/project_cognition.py" prepare \
+  --project "<project-root>" \
+  --hash-verify-interval-hours 6
+```
+
 ### Validate cognition integrity
 
 ```bash
 python "<skill-directory>/scripts/project_cognition.py" validate --project "<project-root>"
+```
+
+For a complete source-hash comparison:
+
+```bash
+python "<skill-directory>/scripts/project_cognition.py" validate \
+  --project "<project-root>" \
+  --deep
 ```
 
 ### Fully rebuild generated cognition
@@ -142,6 +183,6 @@ Do not paste an entire context pack back to the user. Use it internally to navig
 
 Read these only when needed:
 
-- `references/operating-model.md`: ownership, synchronization, and consistency model.
-- `references/index-schema.md`: generated data and SQLite schema.
+- `references/operating-model.md`: ownership, synchronization, caching, and consistency model.
+- `references/index-schema.md`: generated data, SQLite schema, and optional FTS5 index.
 - `references/security-and-ignore.md`: exclusion and secret-handling rules.

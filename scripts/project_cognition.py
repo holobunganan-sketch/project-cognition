@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
 
-TOOL_VERSION = "1.0.0"
+TOOL_VERSION = "1.1.0"
 SCHEMA_VERSION = 1
 COGNITION_DIRNAME = ".project-cognition"
 DB_RELATIVE = Path("cache") / "index.sqlite3"
@@ -41,6 +41,9 @@ MAX_HEADINGS_PER_FILE = 500
 MAX_SEARCH_TERMS = 120
 MAX_GENERATED_FILE_LIST = 600
 MAX_CONTEXT_PACKS = 20
+DEFAULT_HASH_VERIFY_INTERVAL_HOURS = 24
+FTS_CANDIDATE_LIMIT = 250
+RELATED_SEED_LIMIT = 4
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 SKILL_DIR = SCRIPT_DIR.parent
@@ -132,6 +135,7 @@ SENSITIVE_ASSIGNMENT_RE = re.compile(
     r"(?i)(password|passwd|pwd|secret|token|api[_-]?key|authorization|credential|private[_-]?key)\s*[:=]"
 )
 HIGH_ENTROPY_RE = re.compile(r"^(?:[A-Fa-f0-9]{24,}|[A-Za-z0-9+/=_-]{40,}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)$")
+SECRET_TOKEN_RE = re.compile(r"(?i)\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[A-Z0-9]{16})\b")
 EN_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.$:/-]{1,80}")
 ZH_SEQUENCE_RE = re.compile(r"[\u3400-\u9fff]{2,24}")
 
@@ -191,7 +195,23 @@ class ProjectLock:
             stat = self.lock_path.stat()
         except FileNotFoundError:
             return False
-        return (time.time() - stat.st_mtime) > LOCK_STALE_SECONDS
+        if (time.time() - stat.st_mtime) <= LOCK_STALE_SECONDS:
+            return False
+        try:
+            payload = json.loads(self.lock_path.read_text(encoding="utf-8"))
+            pid = int(payload.get("pid", 0))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pid = 0
+        if pid > 0:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return True
+            except (PermissionError, OSError):
+                return False
+            else:
+                return False
+        return True
 
     def __exit__(self, exc_type, exc, tb) -> None:  # type: ignore[no-untyped-def]
         if self.acquired:
@@ -201,10 +221,6 @@ class ProjectLock:
 
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
-
-
-def local_stamp() -> str:
-    return dt.datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
 def json_dumps(data: object, pretty: bool = True) -> str:
@@ -256,12 +272,14 @@ def run_git(root: Path, args: Sequence[str], timeout: float = 20.0) -> Optional[
     return proc.stdout
 
 
-def resolve_project_root(project: str) -> Path:
+def resolve_project_root(project: str, exact: bool = False) -> Path:
     candidate = Path(project).expanduser().resolve()
     if not candidate.exists():
         raise CognitionError(f"Project path does not exist: {candidate}")
     if candidate.is_file():
         candidate = candidate.parent
+    if exact:
+        return candidate
     git_root_bytes = run_git(candidate, ["rev-parse", "--show-toplevel"])
     if git_root_bytes:
         try:
@@ -319,6 +337,68 @@ def git_info(root: Path) -> Dict[str, object]:
         "dirty": relevant_entries > 0,
         "status_counts": dict(sorted(counts.items())),
     }
+
+
+def git_changed_paths(root: Path) -> Set[str]:
+    """Return tracked and untracked paths Git currently reports as changed."""
+    raw = run_git(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all"], timeout=30.0)
+    if raw is None:
+        return set()
+    entries = raw.split(b"\0")
+    paths: Set[str] = set()
+    index = 0
+    while index < len(entries):
+        entry = entries[index]
+        index += 1
+        if not entry or len(entry) < 4:
+            continue
+        decoded = entry.decode("utf-8", "surrogateescape")
+        code = decoded[:2]
+        rel = decoded[3:].replace("\\", "/")
+        if rel:
+            paths.add(rel)
+        if "R" in code or "C" in code:
+            if index < len(entries) and entries[index]:
+                old_rel = entries[index].decode("utf-8", "surrogateescape").replace("\\", "/")
+                index += 1
+                if old_rel:
+                    paths.add(old_rel)
+    return {path for path in paths if not (path == COGNITION_DIRNAME or path.startswith(COGNITION_DIRNAME + "/"))}
+
+
+def git_diff_paths(root: Path, old_head: Optional[str], new_head: Optional[str]) -> Set[str]:
+    if not old_head or not new_head or old_head == new_head:
+        return set()
+    raw = run_git(root, ["diff", "--name-only", "-z", old_head, new_head, "--"], timeout=60.0)
+    if raw is None:
+        return set()
+    return {
+        item.decode("utf-8", "surrogateescape").replace("\\", "/")
+        for item in raw.split(b"\0")
+        if item
+    }
+
+
+def parse_utc_timestamp(value: Optional[str]) -> Optional[dt.datetime]:
+    if not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def full_hash_verification_due(conn: sqlite3.Connection, interval_hours: int) -> bool:
+    if interval_hours <= 0:
+        return False
+    previous = parse_utc_timestamp(get_meta(conn, "last_full_hash_verification_at"))
+    if previous is None:
+        return True
+    age = dt.datetime.now(dt.timezone.utc) - previous
+    return age >= dt.timedelta(hours=interval_hours)
 
 
 def load_ignore_patterns() -> List[str]:
@@ -597,7 +677,7 @@ def redact_sensitive_lines(text: str) -> str:
             key = re.split(r"[:=]", line, maxsplit=1)[0]
             output.append(f"{key}=<redacted>")
         else:
-            output.append(line)
+            output.append(SECRET_TOKEN_RE.sub("<redacted-token>", line))
     return "\n".join(output)
 
 
@@ -827,6 +907,43 @@ def connect_db(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+def fts_document(path: str, search_terms_json: str) -> str:
+    tokens: List[str] = []
+    tokens.extend(split_identifier(path))
+    try:
+        weighted_terms = json.loads(search_terms_json)
+    except (TypeError, json.JSONDecodeError):
+        weighted_terms = []
+    for item in weighted_terms:
+        if not isinstance(item, list) or len(item) != 2:
+            continue
+        term = str(item[0]).strip()
+        try:
+            weight = int(item[1])
+        except (TypeError, ValueError):
+            weight = 1
+        if term:
+            tokens.extend([term] * max(1, min(8, 1 + weight // 5)))
+    return " ".join(tokens)
+
+
+def fts_candidate_paths(conn: sqlite3.Connection, terms: Set[str], limit: int = FTS_CANDIDATE_LIMIT) -> Dict[str, float]:
+    if not terms or get_meta(conn, "fts5_available") != "1":
+        return {}
+    safe_terms = [term.replace('"', '""') for term in sorted(terms) if term.strip()]
+    if not safe_terms:
+        return {}
+    query = " OR ".join(f'"{term}"' for term in safe_terms[:40])
+    try:
+        rows = conn.execute(
+            "SELECT path, bm25(file_search) AS rank FROM file_search WHERE file_search MATCH ? ORDER BY rank LIMIT ?",
+            (query, limit),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    return {str(row["path"]): float(row["rank"]) for row in rows}
+
+
 def initialize_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
@@ -896,6 +1013,23 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
             f"Index schema {current_schema} is incompatible with tool schema {SCHEMA_VERSION}. "
             "Run the rebuild command."
         )
+    try:
+        conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS file_search USING fts5(path UNINDEXED, terms)")
+    except sqlite3.OperationalError:
+        set_meta(conn, "fts5_available", "0")
+    else:
+        set_meta(conn, "fts5_available", "1")
+        indexed = int(conn.execute("SELECT COUNT(*) FROM file_search").fetchone()[0])
+        file_count = int(conn.execute("SELECT COUNT(*) FROM files").fetchone()[0])
+        if indexed != file_count:
+            conn.execute("DELETE FROM file_search")
+            conn.executemany(
+                "INSERT INTO file_search(path, terms) VALUES(?, ?)",
+                [
+                    (str(row["path"]), fts_document(str(row["path"]), str(row["search_terms"])))
+                    for row in conn.execute("SELECT path, search_terms FROM files")
+                ],
+            )
 
 
 def get_meta(conn: sqlite3.Connection, key: str) -> Optional[str]:
@@ -969,6 +1103,12 @@ def upsert_file(
         "INSERT INTO imports(file_path, target, line) VALUES(?, ?, ?)",
         [(path, str(i["target"]), int(i["line"])) for i in imports],
     )
+    if get_meta(conn, "fts5_available") == "1":
+        conn.execute("DELETE FROM file_search WHERE path = ?", (path,))
+        conn.execute(
+            "INSERT INTO file_search(path, terms) VALUES(?, ?)",
+            (path, fts_document(path, search_terms_json)),
+        )
 
 
 def ensure_output_layout(cognition_dir: Path) -> None:
@@ -985,7 +1125,13 @@ def ensure_output_layout(cognition_dir: Path) -> None:
         )
 
 
-def prepare_project(root: Path, max_file_size: int = DEFAULT_MAX_FILE_SIZE, force: bool = False) -> Dict[str, object]:
+def prepare_project(
+    root: Path,
+    max_file_size: int = DEFAULT_MAX_FILE_SIZE,
+    force: bool = False,
+    verify_hashes: bool = False,
+    hash_verify_interval_hours: int = DEFAULT_HASH_VERIFY_INTERVAL_HOURS,
+) -> Dict[str, object]:
     cognition_dir = root / COGNITION_DIRNAME
     ensure_output_layout(cognition_dir)
     lock_path = cognition_dir / ".write.lock"
@@ -1002,6 +1148,14 @@ def prepare_project(root: Path, max_file_size: int = DEFAULT_MAX_FILE_SIZE, forc
             patterns = load_ignore_patterns()
             discovered, discovery_stats = discover_files(root, patterns, max_file_size)
             existing = load_existing_files(conn)
+            current_git = git_info(root)
+            prior_git_head = get_meta(conn, "git_head")
+            forced_hash_paths = git_changed_paths(root)
+            forced_hash_paths.update(
+                git_diff_paths(root, prior_git_head, str(current_git.get("head") or "") or None)
+            )
+            periodic_verification = full_hash_verification_due(conn, hash_verify_interval_hours)
+            full_hash_verification = bool(force or verify_hashes or periodic_verification)
             discovered_map: Dict[str, Path] = {}
             for path in discovered:
                 rel = safe_relative(path, root)
@@ -1028,6 +1182,8 @@ def prepare_project(root: Path, max_file_size: int = DEFAULT_MAX_FILE_SIZE, forc
             with conn:
                 for rel in deleted_paths:
                     conn.execute("DELETE FROM files WHERE path = ?", (rel,))
+                    if get_meta(conn, "fts5_available") == "1":
+                        conn.execute("DELETE FROM file_search WHERE path = ?", (rel,))
 
                 for rel in sorted(new_paths):
                     path = discovered_map[rel]
@@ -1037,7 +1193,13 @@ def prepare_project(root: Path, max_file_size: int = DEFAULT_MAX_FILE_SIZE, forc
                         errors.append({"path": rel, "error": str(exc)})
                         continue
                     old = existing.get(rel)
-                    if not force and old and int(old["size"]) == stat.st_size and int(old["mtime_ns"]) == stat.st_mtime_ns:
+                    must_hash = full_hash_verification or rel in forced_hash_paths
+                    if (
+                        not must_hash
+                        and old
+                        and int(old["size"]) == stat.st_size
+                        and int(old["mtime_ns"]) == stat.st_mtime_ns
+                    ):
                         unchanged_count += 1
                         continue
                     try:
@@ -1116,7 +1278,7 @@ def prepare_project(root: Path, max_file_size: int = DEFAULT_MAX_FILE_SIZE, forc
                 content_changed = bool(changes or force)
                 snapshot = candidate_snapshot if content_changed or prior_snapshot == 0 else prior_snapshot
                 now = utc_now()
-                git = git_info(root)
+                git = current_git
                 set_meta(conn, "schema_version", SCHEMA_VERSION)
                 set_meta(conn, "tool_version", TOOL_VERSION)
                 set_meta(conn, "project_root", str(root.resolve()))
@@ -1127,6 +1289,8 @@ def prepare_project(root: Path, max_file_size: int = DEFAULT_MAX_FILE_SIZE, forc
                 set_meta(conn, "max_file_size", max_file_size)
                 if content_changed or prior_snapshot == 0:
                     set_meta(conn, "last_content_change_at", now)
+                if full_hash_verification and not errors:
+                    set_meta(conn, "last_full_hash_verification_at", now)
                 if changes:
                     conn.executemany(
                         "INSERT INTO changes(snapshot, change_type, path, old_path, sha256, changed_at) VALUES(?, ?, ?, ?, ?, ?)",
@@ -1166,6 +1330,13 @@ def prepare_project(root: Path, max_file_size: int = DEFAULT_MAX_FILE_SIZE, forc
                 "unchanged_files": unchanged_count,
                 "discovery": discovery_stats,
                 "errors": errors,
+                "synchronization": {
+                    "full_hash_verification": full_hash_verification,
+                    "periodic_verification_due": periodic_verification,
+                    "forced_hash_paths": len(forced_hash_paths),
+                    "git_head_changed": bool(prior_git_head and prior_git_head != str(current_git.get("head") or "")),
+                    "hash_verify_interval_hours": hash_verify_interval_hours,
+                },
                 "start_here": str(cognition_dir / "START_HERE.md"),
             }
             return result
@@ -1259,6 +1430,10 @@ def generate_views(
         "last_changes": display_changes[:200],
         "discovery": dict(discovery_stats),
         "errors": list(errors),
+        "synchronization": {
+            "last_full_hash_verification_at": get_meta(conn, "last_full_hash_verification_at"),
+            "fts5_available": get_meta(conn, "fts5_available") == "1",
+        },
     }
     atomic_write_json(cognition_dir / "manifest.json", manifest)
 
@@ -1514,35 +1689,95 @@ def generate_module_views(module_dir: Path, conn: sqlite3.Connection, snapshot: 
                 path.unlink()
 
 
-def load_structural_maps(conn: sqlite3.Connection) -> Tuple[Dict[str, List[sqlite3.Row]], Dict[str, List[sqlite3.Row]], Dict[str, List[sqlite3.Row]]]:
+def load_structural_maps(
+    conn: sqlite3.Connection,
+    paths: Optional[Set[str]] = None,
+) -> Tuple[Dict[str, List[sqlite3.Row]], Dict[str, List[sqlite3.Row]], Dict[str, List[sqlite3.Row]]]:
     symbols: Dict[str, List[sqlite3.Row]] = collections.defaultdict(list)
     headings: Dict[str, List[sqlite3.Row]] = collections.defaultdict(list)
     imports: Dict[str, List[sqlite3.Row]] = collections.defaultdict(list)
-    for row in conn.execute("SELECT file_path, kind, name, line, signature FROM symbols ORDER BY file_path, line"):
+    clauses: Tuple[object, ...] = ()
+    where = ""
+    if paths:
+        placeholders = ",".join("?" for _ in paths)
+        where = f" WHERE file_path IN ({placeholders})"
+        clauses = tuple(sorted(paths))
+    for row in conn.execute(
+        "SELECT file_path, kind, name, line, signature FROM symbols" + where + " ORDER BY file_path, line",
+        clauses,
+    ):
         symbols[str(row["file_path"])].append(row)
-    for row in conn.execute("SELECT file_path, level, title, line FROM headings ORDER BY file_path, line"):
+    for row in conn.execute(
+        "SELECT file_path, level, title, line FROM headings" + where + " ORDER BY file_path, line",
+        clauses,
+    ):
         headings[str(row["file_path"])].append(row)
-    for row in conn.execute("SELECT file_path, target, line FROM imports ORDER BY file_path, line"):
+    for row in conn.execute(
+        "SELECT file_path, target, line FROM imports" + where + " ORDER BY file_path, line",
+        clauses,
+    ):
         imports[str(row["file_path"])].append(row)
     return symbols, headings, imports
+
+
+def recent_change_paths(conn: sqlite3.Connection, max_count: int = 100) -> Set[str]:
+    row = conn.execute("SELECT MAX(snapshot) FROM changes").fetchone()
+    if not row or row[0] is None:
+        return set()
+    snapshot = int(row[0])
+    count = int(conn.execute("SELECT COUNT(*) FROM changes WHERE snapshot = ?", (snapshot,)).fetchone()[0])
+    if count > max_count:
+        return set()
+    return {
+        str(change[0])
+        for change in conn.execute(
+            "SELECT path FROM changes WHERE snapshot = ? AND change_type IN ('added','modified','renamed')",
+            (snapshot,),
+        )
+    }
+
+
+def retrieval_candidates(conn: sqlite3.Connection, terms: Set[str]) -> Tuple[Optional[Set[str]], Dict[str, float]]:
+    fts_ranks = fts_candidate_paths(conn, terms)
+    if get_meta(conn, "fts5_available") != "1":
+        return None, {}
+    candidates: Set[str] = set(fts_ranks)
+    for term in sorted(terms)[:30]:
+        pattern = f"%{term}%"
+        for row in conn.execute("SELECT path FROM files WHERE path LIKE ? LIMIT 40", (pattern,)):
+            candidates.add(str(row[0]))
+    candidates.update(recent_change_paths(conn))
+    for row in conn.execute("SELECT path FROM files ORDER BY entrypoint_score DESC, path LIMIT 24"):
+        candidates.add(str(row[0]))
+    return candidates or None, fts_ranks
 
 
 def score_files(conn: sqlite3.Connection, task: str) -> List[Dict[str, object]]:
     terms = task_terms(task)
     task_lower = task.casefold()
-    symbols_map, headings_map, imports_map = load_structural_maps(conn)
-    recent_changes = {
-        str(row[0]) for row in conn.execute(
-            "SELECT path FROM changes WHERE snapshot = (SELECT MAX(snapshot) FROM changes)"
-        )
-    }
+    candidate_paths, fts_ranks = retrieval_candidates(conn, terms)
+    symbols_map, headings_map, imports_map = load_structural_maps(conn, candidate_paths)
+    recent_changes = recent_change_paths(conn)
     scored: List[Dict[str, object]] = []
-    for row in conn.execute("SELECT * FROM files"):
+    if candidate_paths:
+        placeholders = ",".join("?" for _ in candidate_paths)
+        file_rows = conn.execute(
+            f"SELECT * FROM files WHERE path IN ({placeholders})",
+            tuple(sorted(candidate_paths)),
+        )
+    else:
+        file_rows = conn.execute("SELECT * FROM files")
+    fts_order = {path: index for index, path in enumerate(fts_ranks)}
+    for row in file_rows:
         path = str(row["path"])
         path_lower = path.casefold()
         file_terms = {str(item[0]): int(item[1]) for item in json.loads(str(row["search_terms"]))}
         score = 0.0
         reasons: List[str] = []
+        if path in fts_order:
+            boost = max(1.0, 12.0 - (fts_order[path] * 0.05))
+            score += boost
+            reasons.append("full-text index match")
         basename = path.rsplit("/", 1)[-1].casefold()
         stem = basename.rsplit(".", 1)[0]
         if basename and basename in task_lower:
@@ -1622,6 +1857,131 @@ def score_files(conn: sqlite3.Connection, task: str) -> List[Dict[str, object]]:
     return scored
 
 
+def resolve_import_target(source_path: str, target: str, known_paths: Set[str]) -> List[str]:
+    normalized = target.strip().strip("'\"").replace("\\", "/")
+    if not normalized:
+        return []
+    source_parent = Path(source_path).parent
+    candidates: List[str] = []
+    suffixes = ("", ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".rs", ".go")
+
+    if normalized.startswith("."):
+        if normalized.startswith("./") or normalized.startswith("../"):
+            base = (source_parent / normalized).as_posix()
+        else:
+            dots = len(normalized) - len(normalized.lstrip("."))
+            remainder = normalized[dots:].lstrip(".").replace(".", "/")
+            parent = source_parent
+            for _ in range(max(0, dots - 1)):
+                parent = parent.parent
+            base = (parent / remainder).as_posix()
+        for suffix in suffixes:
+            candidates.append(base + suffix)
+        for suffix in suffixes[1:]:
+            candidates.append(f"{base}/index{suffix}")
+    else:
+        module_path = normalized.split("#", 1)[0].split("?", 1)[0].replace("::", "/").replace(".", "/")
+        for suffix in suffixes:
+            candidates.append(module_path + suffix)
+        for suffix in suffixes[1:]:
+            candidates.append(f"{module_path}/index{suffix}")
+
+    exact = [candidate for candidate in candidates if candidate in known_paths]
+    if exact:
+        return list(dict.fromkeys(exact))
+    endings = tuple("/" + candidate for candidate in candidates if candidate)
+    matched = [path for path in known_paths if path in candidates or (endings and path.endswith(endings))]
+    return sorted(matched, key=lambda path: (path.count("/"), len(path), path))[:4]
+
+
+def hydrate_related_item(
+    conn: sqlite3.Connection,
+    path: str,
+    score: float,
+    reason: str,
+) -> Optional[Dict[str, object]]:
+    row = conn.execute("SELECT * FROM files WHERE path = ?", (path,)).fetchone()
+    if row is None:
+        return None
+    symbols_map, headings_map, imports_map = load_structural_maps(conn, {path})
+    return {
+        "path": path,
+        "score": round(max(0.1, score), 3),
+        "reasons": [reason],
+        "language": str(row["language"]),
+        "category": str(row["category"]),
+        "line_count": int(row["line_count"]),
+        "symbols": symbols_map.get(path, []),
+        "headings": headings_map.get(path, []),
+        "imports": imports_map.get(path, []),
+        "entrypoint_score": float(row["entrypoint_score"]),
+    }
+
+
+def expand_related_files(
+    conn: sqlite3.Connection,
+    ranked: Sequence[Dict[str, object]],
+    max_files: int,
+) -> List[Dict[str, object]]:
+    if not ranked or max_files <= 1:
+        return list(ranked[:max_files])
+    known_paths = {str(row[0]) for row in conn.execute("SELECT path FROM files")}
+    imports_by_source: Dict[str, List[str]] = collections.defaultdict(list)
+    reverse: Dict[str, List[str]] = collections.defaultdict(list)
+    for row in conn.execute("SELECT file_path, target FROM imports ORDER BY file_path, line"):
+        source = str(row["file_path"])
+        for resolved in resolve_import_target(source, str(row["target"]), known_paths):
+            imports_by_source[source].append(resolved)
+            reverse[resolved].append(source)
+
+    seed_count = min(RELATED_SEED_LIMIT, len(ranked), max(1, max_files - 1))
+    seed_pool = list(ranked[: max(RELATED_SEED_LIMIT * 2, seed_count)])
+    seed_pool.sort(
+        key=lambda item: (
+            1 if str(item.get("category")) == "test" else 0,
+            -float(item.get("score", 0.0)),
+            str(item.get("path", "")),
+        )
+    )
+    selected: List[Dict[str, object]] = list(seed_pool[:seed_count])
+    selected_paths = {str(item["path"]) for item in selected}
+    ranked_by_path = {str(item["path"]): item for item in ranked}
+
+    for seed in list(selected):
+        if len(selected) >= max_files:
+            break
+        seed_path = str(seed["path"])
+        neighbors: List[Tuple[str, str]] = []
+        neighbors.extend((path, f"direct dependency of {seed_path}") for path in imports_by_source.get(seed_path, []))
+        neighbors.extend((path, f"imports or references {seed_path}") for path in reverse.get(seed_path, []))
+        added_for_seed = 0
+        for neighbor, reason in neighbors:
+            if neighbor in selected_paths:
+                continue
+            existing = ranked_by_path.get(neighbor)
+            if existing is not None:
+                item = dict(existing)
+                item["reasons"] = [*list(existing["reasons"]), reason]
+            else:
+                item = hydrate_related_item(conn, neighbor, float(seed["score"]) * 0.72, reason)
+                if item is None:
+                    continue
+            selected.append(item)
+            selected_paths.add(neighbor)
+            added_for_seed += 1
+            if len(selected) >= max_files or added_for_seed >= 2:
+                break
+
+    for item in ranked:
+        if len(selected) >= max_files:
+            break
+        path = str(item["path"])
+        if path not in selected_paths:
+            selected.append(item)
+            selected_paths.add(path)
+    return selected
+
+
 def find_excerpt(text: str, terms: Set[str], preferred_lines: Sequence[int], max_lines: int = 26) -> Tuple[int, int, str]:
     lines = text.splitlines()
     if not lines:
@@ -1670,15 +2030,41 @@ def relevant_knowledge_notes(cognition_dir: Path, task: str, max_notes: int = 3)
     return [(path, text) for _, path, text in scored[:max_notes]]
 
 
+def knowledge_digest(cognition_dir: Path) -> str:
+    digest = hashlib.sha256()
+    knowledge_dir = cognition_dir / "knowledge"
+    if not knowledge_dir.exists():
+        return digest.hexdigest()
+    for path in sorted(knowledge_dir.rglob("*.md")):
+        try:
+            rel = path.relative_to(knowledge_dir).as_posix()
+            data = path.read_bytes()
+        except OSError:
+            continue
+        digest.update(rel.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(data)
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def prune_context_packs(context_dir: Path) -> None:
     files = sorted(
         [p for p in context_dir.glob("*.md") if p.name != "current.md"],
-        key=lambda p: p.stat().st_mtime,
+        key=lambda p: p.stat().st_mtime if p.exists() else 0.0,
         reverse=True,
     )
     for path in files[MAX_CONTEXT_PACKS:]:
         with contextlib.suppress(OSError):
             path.unlink()
+        sidecar = path.with_suffix(".json")
+        with contextlib.suppress(OSError):
+            sidecar.unlink()
+    live_stems = {path.stem for path in files[:MAX_CONTEXT_PACKS]}
+    for sidecar in context_dir.glob("snapshot-*.json"):
+        if sidecar.stem not in live_stems:
+            with contextlib.suppress(OSError):
+                sidecar.unlink()
 
 
 def generate_context_pack(
@@ -1687,17 +2073,67 @@ def generate_context_pack(
     max_files: int,
     max_chars: int,
     max_file_size: int,
+    verify_hashes: bool = False,
+    hash_verify_interval_hours: int = DEFAULT_HASH_VERIFY_INTERVAL_HOURS,
+    include_related: bool = True,
 ) -> Dict[str, object]:
     max_chars = max(2000, max_chars)
-    prepare_result = prepare_project(root, max_file_size=max_file_size)
+    prepare_result = prepare_project(
+        root,
+        max_file_size=max_file_size,
+        verify_hashes=verify_hashes,
+        hash_verify_interval_hours=hash_verify_interval_hours,
+    )
     cognition_dir = root / COGNITION_DIRNAME
     conn = connect_db(cognition_dir / DB_RELATIVE)
     try:
         scored = score_files(conn, task)
-        selected = scored[:max(1, max_files)]
+        selected = (
+            expand_related_files(conn, scored, max(1, max_files))
+            if include_related
+            else scored[:max(1, max_files)]
+        )
         terms = task_terms(task)
         snapshot = int(get_meta(conn, "snapshot") or "0")
         git = git_info(root)
+        context_dir = cognition_dir / "context-packs"
+        context_dir.mkdir(parents=True, exist_ok=True)
+        cache_payload = {
+            "tool_version": TOOL_VERSION,
+            "snapshot": snapshot,
+            "task": task,
+            "max_files": max_files,
+            "max_chars": max_chars,
+            "include_related": include_related,
+            "knowledge_digest": knowledge_digest(cognition_dir),
+            "selected_paths": [str(item["path"]) for item in selected],
+        }
+        cache_key = hashlib.sha256(json_dumps(cache_payload, pretty=False).encode("utf-8")).hexdigest()[:16]
+        cached_path = context_dir / f"snapshot-{snapshot}-{cache_key}.md"
+        cached_meta_path = context_dir / f"snapshot-{snapshot}-{cache_key}.json"
+        if cached_path.exists() and cached_meta_path.exists():
+            try:
+                cached_content = cached_path.read_text(encoding="utf-8")
+                cached_meta = json.loads(cached_meta_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                cached_content = ""
+                cached_meta = {}
+            if cached_content:
+                atomic_write_text(context_dir / "current.md", cached_content)
+                return {
+                    "command": "context",
+                    "state": "cached",
+                    "cache_hit": True,
+                    "project_root": str(root),
+                    "snapshot": snapshot,
+                    "prepare_state": prepare_result.get("state"),
+                    "context_path": str(cached_path),
+                    "current_context_path": str(context_dir / "current.md"),
+                    "selected_files": cached_meta.get("selected_files", []),
+                    "characters": len(cached_content),
+                    "task_terms": sorted(terms)[:100],
+                    "related_expansion": include_related,
+                }
         lines: List[str] = [
             "# Task context pack",
             "",
@@ -1780,7 +2216,7 @@ def generate_context_pack(
             lines.extend(["", "## Relevant durable notes", ""])
             for note_path, note_text in notes:
                 rel = note_path.relative_to(cognition_dir).as_posix()
-                excerpt = note_text[:3000]
+                excerpt = redact_sensitive_lines(note_text[:3000])
                 section = f"### `{rel}`\n\n{excerpt}"
                 if used + len(section) > char_budget:
                     break
@@ -1798,24 +2234,23 @@ def generate_context_pack(
         content = "\n".join(lines).rstrip() + "\n"
         if len(content) > max_chars:
             content = content[: max_chars - 80].rstrip() + "\n\n_[Context pack truncated at configured limit.]_\n"
-        digest = hashlib.sha256(task.encode("utf-8")).hexdigest()[:10]
-        context_dir = cognition_dir / "context-packs"
-        context_dir.mkdir(parents=True, exist_ok=True)
-        timestamped = context_dir / f"{local_stamp()}-{digest}.md"
-        atomic_write_text(timestamped, content)
+        atomic_write_text(cached_path, content)
+        atomic_write_json(cached_meta_path, {"selected_files": included_files, "cache": cache_payload})
         atomic_write_text(context_dir / "current.md", content)
         prune_context_packs(context_dir)
         return {
             "command": "context",
             "state": "ready",
+            "cache_hit": False,
             "project_root": str(root),
             "snapshot": snapshot,
             "prepare_state": prepare_result.get("state"),
-            "context_path": str(timestamped),
+            "context_path": str(cached_path),
             "current_context_path": str(context_dir / "current.md"),
             "selected_files": included_files,
             "characters": len(content),
             "task_terms": sorted(terms)[:100],
+            "related_expansion": include_related,
         }
     finally:
         conn.close()
@@ -1855,19 +2290,29 @@ def inspect_status(root: Path, max_file_size: int) -> Dict[str, object]:
                 stale_paths.append(rel)
         added = sorted(new_paths - old_paths)
         deleted = sorted(old_paths - new_paths)
-        stale = bool(stale_paths or added or deleted)
+        git_paths = git_changed_paths(root)
+        git_modified = sorted((git_paths & old_paths & new_paths) - set(stale_paths))
+        possible_modified = sorted(set(stale_paths) | set(git_modified))
+        stale = bool(possible_modified or added or deleted)
+        if stale_paths or added or deleted:
+            state = "stale_by_metadata"
+        elif git_modified:
+            state = "stale_by_git"
+        else:
+            state = "clean_by_metadata"
         return {
             "command": "status",
-            "state": "stale_by_metadata" if stale else "clean_by_metadata",
+            "state": state,
             "project_root": str(root),
             "snapshot": int(get_meta(conn, "snapshot") or "0"),
             "indexed_files": len(existing),
-            "possible_modified": stale_paths[:100],
+            "possible_modified": possible_modified[:100],
             "possible_added": added[:100],
             "possible_deleted": deleted[:100],
+            "git_only_modified": git_modified[:100],
             "git": git_info(root),
             "discovery": discovery_stats,
-            "note": "Run prepare for content-hash verification." if stale else "No path, size, or mtime differences detected.",
+            "note": "Run prepare for content-hash verification." if stale else "No path, size, mtime, or Git-status differences detected.",
         }
     finally:
         conn.close()
@@ -2032,23 +2477,55 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     def common(command_parser: argparse.ArgumentParser) -> None:
+        command_parser.add_argument(
+            "--compact-json",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            help=argparse.SUPPRESS,
+        )
         command_parser.add_argument("--project", default=".", help="Project path. Git root is used when detected.")
+        command_parser.add_argument(
+            "--exact-root",
+            action="store_true",
+            help="Use the supplied directory as the project root instead of ascending to the Git root.",
+        )
         command_parser.add_argument(
             "--max-file-size",
             type=positive_int,
             default=DEFAULT_MAX_FILE_SIZE,
             help=f"Maximum indexed file size in bytes (default: {DEFAULT_MAX_FILE_SIZE}).",
         )
+        command_parser.add_argument(
+            "--hash-verify-interval-hours",
+            type=positive_int,
+            default=DEFAULT_HASH_VERIFY_INTERVAL_HOURS,
+            help=f"Periodic full hash verification interval (default: {DEFAULT_HASH_VERIFY_INTERVAL_HOURS} hours).",
+        )
 
     prepare_parser = sub.add_parser("prepare", help="Initialize or incrementally refresh project cognition.")
     common(prepare_parser)
     prepare_parser.add_argument("--force", action="store_true", help="Reparse all eligible files even when hashes match.")
+    prepare_parser.add_argument(
+        "--verify-hashes",
+        action="store_true",
+        help="Hash every eligible file during this refresh, including metadata-unchanged files.",
+    )
 
     context_parser = sub.add_parser("context", help="Refresh cognition and build a task-specific context pack.")
     common(context_parser)
     context_parser.add_argument("--task", required=True, help="Current task used for retrieval.")
     context_parser.add_argument("--max-files", type=positive_int, default=DEFAULT_CONTEXT_FILES)
     context_parser.add_argument("--max-chars", type=positive_int, default=DEFAULT_CONTEXT_CHARS)
+    context_parser.add_argument(
+        "--verify-hashes",
+        action="store_true",
+        help="Hash every eligible file before building context.",
+    )
+    context_parser.add_argument(
+        "--no-related",
+        action="store_true",
+        help="Disable one-hop dependency and importer expansion.",
+    )
 
     status_parser = sub.add_parser("status", help="Check initialization and metadata-level staleness without updating.")
     common(status_parser)
@@ -2062,9 +2539,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     install_parser = sub.add_parser("install-entry", help="Add an idempotent project-cognition block to AGENTS.md.")
     install_parser.add_argument("--project", default=".")
+    install_parser.add_argument("--exact-root", action="store_true")
+    install_parser.add_argument("--compact-json", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
 
     remove_parser = sub.add_parser("remove-entry", help="Remove the managed project-cognition block from AGENTS.md.")
     remove_parser.add_argument("--project", default=".")
+    remove_parser.add_argument("--exact-root", action="store_true")
+    remove_parser.add_argument("--compact-json", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
 
     return parser
 
@@ -2073,9 +2554,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        root = resolve_project_root(args.project)
+        root = resolve_project_root(args.project, exact=bool(getattr(args, "exact_root", False)))
         if args.command == "prepare":
-            result = prepare_project(root, max_file_size=args.max_file_size, force=args.force)
+            result = prepare_project(
+                root,
+                max_file_size=args.max_file_size,
+                force=args.force,
+                verify_hashes=args.verify_hashes,
+                hash_verify_interval_hours=args.hash_verify_interval_hours,
+            )
         elif args.command == "context":
             result = generate_context_pack(
                 root,
@@ -2083,6 +2570,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 max_files=args.max_files,
                 max_chars=args.max_chars,
                 max_file_size=args.max_file_size,
+                verify_hashes=args.verify_hashes,
+                hash_verify_interval_hours=args.hash_verify_interval_hours,
+                include_related=not args.no_related,
             )
         elif args.command == "status":
             result = inspect_status(root, max_file_size=args.max_file_size)
