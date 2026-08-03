@@ -1,7 +1,7 @@
 {
   "name": "project-cognition",
   "version": "__VERSION__",
-  "description": "Persistent incremental project indexing and compact task-context retrieval for ChatGPT and Codex.",
+  "description": "Verified incremental project indexing, dependency-aware task context, and reusable context packs for ChatGPT and Codex.",
   "author": {
     "name": "holobunganan-sketch"
   },
@@ -15,17 +15,18 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Project Cognition",
-    "shortDescription": "Incremental project context",
-    "longDescription": "Build and reuse a persistent structural index of project files, refresh only changed content, and generate compact task-specific context packs linked to original source files.",
+    "shortDescription": "Verified incremental project context",
+    "longDescription": "Build and reuse a persistent structural index of project files, verify Git and periodic content changes, narrow retrieval with optional FTS5, expand task context with direct dependencies and callers, and cache stable context packs.",
     "developerName": "Project Cognition",
     "category": "Productivity",
     "capabilities": [
-      "Incrementally index project files",
-      "Generate compact task context packs",
-      "Detect modifications, deletions, and renames",
-      "Preserve local project knowledge across sessions"
+      "Incrementally index and verify project files",
+      "Generate dependency-aware task context packs",
+      "Detect modifications, deletions, renames, and Git-only changes",
+      "Reuse stable task context across sessions",
+      "Preserve local project knowledge across rebuilds"
     ],
-    "defaultPrompt": "Build or refresh project cognition for the current task, then verify important conclusions against source files.",
+    "defaultPrompt": "Build or refresh verified project cognition for the current task, include direct dependencies and callers, then confirm important conclusions against source files.",
     "brandColor": "#2563EB",
     "composerIcon": "./assets/composer-icon.svg",
     "logo": "./assets/logo.svg"

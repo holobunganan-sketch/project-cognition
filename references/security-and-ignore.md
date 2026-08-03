@@ -20,4 +20,15 @@ Users can add patterns to `.project-cognitionignore`. Patterns use a conservativ
 
 Search terms exclude high-entropy tokens, long hexadecimal strings, JWT-like strings, and assignment values on lines whose keys resemble password, secret, token, API key, authorization, or credential fields.
 
-The tool stores hashes, structural metadata, symbols, headings, imports, and selected normalized search terms. Context packs contain source excerpts from selected eligible files. They remain local to the project.
+Context excerpts redact:
+
+- sensitive assignment lines
+- common OpenAI-style `sk-` tokens
+- common GitHub token formats
+- common AWS access-key identifiers
+
+The same redaction applies when durable knowledge notes are copied into a context pack. Project files and knowledge notes remain unchanged.
+
+## Stored data
+
+The tool stores hashes, structural metadata, symbols, headings, imports, selected normalized search terms, cached task-pack metadata, and local source excerpts. All generated data remains local to the project unless the user deliberately commits or shares it.

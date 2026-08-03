@@ -37,8 +37,35 @@ $project-cognition 先建立当前项目认知，然后分析这个项目的架�
 ## 运行要求
 
 - Python 3.9或更高版本。
-- Git可选；Git项目会自动使用Git文件清单和忽略规则。
+- Git可选；Git项目会自动使用Git文件清单、状态和忽略规则。
+- SQLite FTS5可选；不可用时自动回退。
 - 无第三方Python依赖。
+
+## 常用命令
+
+首次建立或增量刷新：
+
+```bash
+python scripts/project_cognition.py prepare --project .
+```
+
+生成任务上下文：
+
+```bash
+python scripts/project_cognition.py context --project . --task "当前任务"
+```
+
+立即完整核验全部文件哈希：
+
+```bash
+python scripts/project_cognition.py prepare --project . --verify-hashes
+```
+
+单体仓库中只索引一个包：
+
+```bash
+python scripts/project_cognition.py prepare --project ./packages/example --exact-root
+```
 
 ## 生成目录
 

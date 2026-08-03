@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import shutil
 import tempfile
 import zipfile
@@ -23,15 +24,7 @@ SKILL_FILES = [
     "VERSION",
 ]
 SKILL_DIRS = ["agents", "assets", "references", "scripts", "tests"]
-
-
-def copy_tree_contents(source: Path, destination: Path) -> None:
-    for item in sorted(source.iterdir(), key=lambda path: path.name):
-        target = destination / item.name
-        if item.is_dir():
-            shutil.copytree(item, target)
-        else:
-            shutil.copy2(item, target)
+RELEASE_IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo", "*.bak", ".DS_Store")
 
 
 def copy_skill(destination: Path) -> None:
@@ -39,7 +32,7 @@ def copy_skill(destination: Path) -> None:
     for relative in SKILL_FILES:
         shutil.copy2(ROOT / relative, destination / relative)
     for relative in SKILL_DIRS:
-        shutil.copytree(ROOT / relative, destination / relative)
+        shutil.copytree(ROOT / relative, destination / relative, ignore=RELEASE_IGNORE)
 
 
 def write_zip(source_parent: Path, root_name: str, output_path: Path) -> None:
@@ -67,6 +60,11 @@ def build(output_dir: Path) -> list[Path]:
     version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
     if not version:
         raise ValueError("VERSION is empty")
+    script_text = (ROOT / "scripts" / "project_cognition.py").read_text(encoding="utf-8")
+    match = re.search(r'^TOOL_VERSION\s*=\s*["\']([^"\']+)["\']', script_text, re.MULTILINE)
+    if not match or match.group(1) != version:
+        found = match.group(1) if match else "missing"
+        raise ValueError(f"VERSION ({version}) does not match TOOL_VERSION ({found})")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     for old in output_dir.glob("project-cognition-*.zip"):

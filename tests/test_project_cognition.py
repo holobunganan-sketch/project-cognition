@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "project_cognition.py"
@@ -106,6 +110,36 @@ class ProjectCognitionTests(unittest.TestCase):
         self.assertEqual(stale["state"], "stale_by_metadata")
         self.assertIn("src/parser.py", stale["possible_modified"])
 
+    def test_release_builder_excludes_transient_files(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        cache_dir = root / "scripts" / "__pycache__"
+        cache_dir.mkdir(exist_ok=True)
+        pyc = cache_dir / "transient.pyc"
+        backup = root / "scripts" / "transient.bak"
+        pyc.write_bytes(b"transient")
+        backup.write_text("transient", encoding="utf-8")
+        try:
+            with tempfile.TemporaryDirectory() as output:
+                subprocess.run(
+                    [sys.executable, str(root / "tools" / "build_release.py"), "--output", output],
+                    cwd=root,
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                archive_path = Path(output) / f"project-cognition-skill-v{pc.TOOL_VERSION}.zip"
+                with zipfile.ZipFile(archive_path) as archive:
+                    names = archive.namelist()
+                self.assertFalse(any("__pycache__" in name for name in names))
+                self.assertFalse(any(name.endswith((".pyc", ".bak")) for name in names))
+        finally:
+            pyc.unlink(missing_ok=True)
+            backup.unlink(missing_ok=True)
+            try:
+                cache_dir.rmdir()
+            except OSError:
+                pass
+
     def test_rebuild_preserves_knowledge(self) -> None:
         pc.prepare_project(self.root)
         note = self.root / ".project-cognition" / "knowledge" / "notes" / "architecture.md"
@@ -128,6 +162,101 @@ class ProjectCognitionTests(unittest.TestCase):
         self.assertEqual(removed["state"], "removed")
         self.assertNotIn(pc.MANAGED_ENTRY_START, agents.read_text(encoding="utf-8"))
         self.assertIn("Existing instructions", agents.read_text(encoding="utf-8"))
+
+
+    def test_git_dirty_path_is_hashed_when_metadata_is_preserved(self) -> None:
+        subprocess.run(["git", "init"], cwd=self.root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(["git", "config", "user.email", "tests@example.com"], cwd=self.root, check=True)
+        subprocess.run(["git", "config", "user.name", "Project Cognition Tests"], cwd=self.root, check=True)
+        subprocess.run(["git", "add", "."], cwd=self.root, check=True)
+        subprocess.run(["git", "commit", "-m", "initial"], cwd=self.root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        first = pc.prepare_project(self.root)
+        target = self.root / "src" / "formatter.py"
+        old_stat = target.stat()
+        original = target.read_text(encoding="utf-8")
+        changed = original.replace("upper()", "lower()")
+        self.assertEqual(len(changed), len(original))
+        target.write_text(changed, encoding="utf-8")
+        os.utime(target, ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns))
+        status = pc.inspect_status(self.root, pc.DEFAULT_MAX_FILE_SIZE)
+        self.assertEqual(status["state"], "stale_by_git")
+        self.assertIn("src/formatter.py", status["git_only_modified"])
+        second = pc.prepare_project(self.root)
+        self.assertEqual(second["state"], "updated")
+        self.assertEqual(second["changes"]["modified"], 1)
+        self.assertGreaterEqual(second["synchronization"]["forced_hash_paths"], 1)
+        self.assertGreater(second["snapshot"], first["snapshot"])
+
+    def test_context_cache_and_knowledge_invalidation(self) -> None:
+        first = pc.generate_context_pack(
+            self.root,
+            task="Fix parser formatter integration",
+            max_files=4,
+            max_chars=20_000,
+            max_file_size=pc.DEFAULT_MAX_FILE_SIZE,
+        )
+        self.assertFalse(first["cache_hit"])
+        second = pc.generate_context_pack(
+            self.root,
+            task="Fix parser formatter integration",
+            max_files=4,
+            max_chars=20_000,
+            max_file_size=pc.DEFAULT_MAX_FILE_SIZE,
+        )
+        self.assertTrue(second["cache_hit"])
+        self.assertEqual(second["state"], "cached")
+        self.assertEqual(first["context_path"], second["context_path"])
+        note = self.root / ".project-cognition" / "knowledge" / "notes" / "parser.md"
+        note.write_text("# Parser note\n\nFormatter integration is stable.\n", encoding="utf-8")
+        third = pc.generate_context_pack(
+            self.root,
+            task="Fix parser formatter integration",
+            max_files=4,
+            max_chars=20_000,
+            max_file_size=pc.DEFAULT_MAX_FILE_SIZE,
+        )
+        self.assertFalse(third["cache_hit"])
+        self.assertNotEqual(second["context_path"], third["context_path"])
+
+    def test_fts_index_is_optional_and_queryable(self) -> None:
+        pc.prepare_project(self.root)
+        db = self.root / ".project-cognition" / "cache" / "index.sqlite3"
+        conn = pc.connect_db(db)
+        try:
+            available = pc.get_meta(conn, "fts5_available") == "1"
+            scored = pc.score_files(conn, "parse_value parser")
+            self.assertIn("src/parser.py", [item["path"] for item in scored[:5]])
+            if available:
+                candidates = pc.fts_candidate_paths(conn, {"parser", "parse"})
+                self.assertIn("src/parser.py", candidates)
+        finally:
+            conn.close()
+
+    def test_related_dependency_expansion(self) -> None:
+        pc.prepare_project(self.root)
+        context = pc.generate_context_pack(
+            self.root,
+            task="Change parse_value behavior",
+            max_files=2,
+            max_chars=20_000,
+            max_file_size=pc.DEFAULT_MAX_FILE_SIZE,
+        )
+        selected = [item["path"] for item in context["selected_files"]]
+        self.assertIn("src/parser.py", selected)
+        self.assertIn("src/formatter.py", selected)
+
+    def test_exact_root_preserves_monorepo_scope(self) -> None:
+        subprocess.run(["git", "init"], cwd=self.root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        package = self.root / "packages" / "demo"
+        package.mkdir(parents=True)
+        self.assertEqual(pc.resolve_project_root(str(package)), self.root.resolve())
+        self.assertEqual(pc.resolve_project_root(str(package), exact=True), package.resolve())
+
+    def test_known_secret_tokens_are_redacted(self) -> None:
+        value = "token = ghp_abcdefghijklmnopqrstuvwxyz1234567890"
+        redacted = pc.redact_sensitive_lines(value)
+        self.assertNotIn("ghp_", redacted)
+        self.assertIn("<redacted>", redacted)
 
     def test_manifest_retains_latest_content_changes_after_clean_prepare(self) -> None:
         first = pc.prepare_project(self.root)
