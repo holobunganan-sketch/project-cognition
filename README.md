@@ -1,0 +1,170 @@
+# Project Cognition
+
+[简体中文](README.zh-CN.md) | English
+
+A standalone Codex skill that builds a persistent, source-linked, incrementally refreshed understanding of a project directory. It reuses prior indexing, detects changed files, and generates compact task-specific context packs so agents can begin repository work with less repeated scanning and fewer input tokens.
+
+## What it does
+
+- Builds a reusable structural index for a project directory.
+- Detects additions, modifications, deletions, and renames incrementally.
+- Records paths, metadata, SHA-256 hashes, symbols, headings, and imports.
+- Generates human-readable project maps and task-specific context packs.
+- Revalidates project state before context retrieval.
+- Preserves manually maintained project knowledge across rebuilds.
+- Excludes common dependency, build, binary, credential, and secret-bearing paths.
+- Runs with the Python standard library and no network access.
+
+## How synchronization works
+
+Project files remain the source of truth. The generated cognition layer is a rebuildable cache.
+
+Every invocation begins with `prepare`:
+
+1. Locate the project root and load the previous manifest.
+2. Compare the current file set and Git state with the previous snapshot.
+3. Use file metadata as a fast filter and SHA-256 as the final content check.
+4. Re-index only added, changed, renamed, or deleted files.
+5. Refresh affected generated views atomically.
+6. Generate a context pack only after the relevant index is current.
+
+No persistent background service is required. Run `prepare` once after a coherent edit batch to provide read-after-write consistency.
+
+## Installation
+
+### Download a release
+
+Download `project-cognition-skill-vX.Y.Z.zip` from the [Releases](../../releases) page and extract it so the final path is:
+
+```text
+~/.agents/skills/project-cognition/SKILL.md
+```
+
+On Windows:
+
+```text
+%USERPROFILE%\.agents\skills\project-cognition\SKILL.md
+```
+
+The release also includes a skills-only plugin package for plugin-based installation.
+
+### Repository-local installation
+
+Copy the `project-cognition` directory to:
+
+```text
+<repository>/.agents/skills/project-cognition/SKILL.md
+```
+
+### Install from source
+
+```bash
+git clone https://github.com/holobunganan-sketch/project-cognition.git
+mkdir -p ~/.agents/skills
+cp -R project-cognition ~/.agents/skills/project-cognition
+```
+
+Restart Codex when the skill does not appear immediately.
+
+## Usage
+
+Explicit invocation:
+
+```text
+$project-cognition Build or refresh project cognition, then explain this repository's architecture.
+```
+
+The skill description also supports implicit invocation for repository-wide analysis, debugging, multi-file editing, architecture review, and onboarding.
+
+## Commands
+
+Run commands through the bundled script:
+
+```bash
+python scripts/project_cognition.py prepare --project .
+python scripts/project_cognition.py context --project . --task "your task"
+python scripts/project_cognition.py status --project .
+python scripts/project_cognition.py validate --project .
+python scripts/project_cognition.py rebuild --project .
+```
+
+Optional project-level activation entry:
+
+```bash
+python scripts/project_cognition.py install-entry --project .
+python scripts/project_cognition.py remove-entry --project .
+```
+
+Use `--help` for complete options.
+
+## Generated project data
+
+The skill creates `.project-cognition/` in the indexed project:
+
+```text
+.project-cognition/
+├── START_HERE.md
+├── manifest.json
+├── generated/
+│   ├── architecture.md
+│   ├── current-state.md
+│   ├── file-map.md
+│   └── modules/
+├── knowledge/
+│   ├── README.md
+│   ├── decisions/
+│   └── notes/
+├── context-packs/
+└── cache/
+    └── index.sqlite3
+```
+
+Machine-maintained data can remain local by adding `.project-cognition/` to `.gitignore`. The `knowledge/` directory is preserved across rebuilds and can be shared intentionally when a team wants durable project knowledge.
+
+## Runtime requirements
+
+- Python 3.9 or later
+- Git is optional
+- No third-party Python packages
+- Windows, macOS, and Linux
+
+## Security model
+
+- Project files remain authoritative.
+- Generated summaries are navigation aids and must be verified against source files before important edits or conclusions.
+- Common credential, private-key, environment, dependency, build, cache, and binary paths are excluded.
+- Sensitive assignment values are redacted from excerpts.
+- The indexer does not execute project code and does not access the network.
+
+Review [security and ignore rules](references/security-and-ignore.md) for details.
+
+## Development
+
+Run tests:
+
+```bash
+python tests/run_tests.py
+```
+
+Build release packages:
+
+```bash
+python tools/build_release.py --output dist
+```
+
+The release builder creates:
+
+- `project-cognition-skill-vX.Y.Z.zip`
+- `project-cognition-plugin-vX.Y.Z.zip`
+- `SHA256SUMS.txt`
+
+## Current limitations
+
+- Automatic activation still depends on the host selecting the skill or the user invoking `$project-cognition` explicitly.
+- Semantic summaries generated by an agent require source verification.
+- The initial version uses deterministic structural and lexical retrieval; it does not require a vector database.
+- Very large or unsupported binary files are skipped.
+
+## License
+
+MIT License. See [LICENSE](LICENSE).
