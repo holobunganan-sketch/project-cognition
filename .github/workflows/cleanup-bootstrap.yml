@@ -1,0 +1,27 @@
+name: Remove bootstrap workflows
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/cleanup-bootstrap.yml
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Remove one-time workflows
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/bootstrap.yml .github/workflows/cleanup-bootstrap.yml
+          git commit -m "Remove one-time publication workflows"
+          git push origin HEAD:main
