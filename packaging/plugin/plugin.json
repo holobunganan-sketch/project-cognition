@@ -1,0 +1,33 @@
+{
+  "name": "project-cognition",
+  "version": "__VERSION__",
+  "description": "Persistent incremental project indexing and compact task-context retrieval for ChatGPT and Codex.",
+  "author": {
+    "name": "holobunganan-sketch"
+  },
+  "license": "MIT",
+  "keywords": [
+    "project-context",
+    "repository-index",
+    "incremental-indexing",
+    "agent-memory"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Project Cognition",
+    "shortDescription": "Incremental project context",
+    "longDescription": "Build and reuse a persistent structural index of project files, refresh only changed content, and generate compact task-specific context packs linked to original source files.",
+    "developerName": "Project Cognition",
+    "category": "Productivity",
+    "capabilities": [
+      "Incrementally index project files",
+      "Generate compact task context packs",
+      "Detect modifications, deletions, and renames",
+      "Preserve local project knowledge across sessions"
+    ],
+    "defaultPrompt": "Build or refresh project cognition for the current task, then verify important conclusions against source files.",
+    "brandColor": "#2563EB",
+    "composerIcon": "./assets/composer-icon.svg",
+    "logo": "./assets/logo.svg"
+  }
+}
